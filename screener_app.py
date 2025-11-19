@@ -7,24 +7,25 @@ Rules:
 Fundamentals (stocks only):
     - TTM net income > 0
     - Total debt / total assets < 0.5
-    - Source: yfinance (quarterly), fallback to Financial Modeling Prep (FMP_API_KEY)
+    - Source: yfinance (quarterly), fallback to Financial Modeling Prep (FMP_API_KEY / secrets)
 
 Market regime:
     - SPY last close > SPY 200-day SMA
 
-Technicals:
+Technicals (configurable by strategy profile):
     - If stock (value style):
-        * RSI(14) between 25 and 45 (mildly oversold)
-        * Price < 20-day SMA (mid Bollinger band)  [discounted vs recent mean]
-        * Price > lower Bollinger band            [not a falling knife]
+        * RSI(14) in configurable range (mildly oversold / value zone)
+        * Optional: price < 20-day SMA (mid Bollinger band)  [discounted vs recent mean]
+        * Optional: price > lower Bollinger band            [not a falling knife]
     - If fund:
-        * RSI(14) < 30
+        * RSI(14) < configurable max (default 30)
 
 Usage:
     python -m streamlit run screener_app.py
 """
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
@@ -90,6 +91,19 @@ class ScreenResult:
             and self.market.spy_trend_ok
             and self.technical.technical_ok
         )
+
+
+@dataclass
+class StrategyConfig:
+    """
+    Configurable technical strategy parameters.
+    """
+    profile_name: str
+    stock_rsi_min: float
+    stock_rsi_max: float
+    require_stock_below_mid: bool
+    require_stock_above_lower: bool
+    fund_rsi_max: float
 
 
 # ---------- Helper functions ----------
@@ -171,13 +185,25 @@ def get_fundamentals_yf(ticker_obj: yf.Ticker) -> Tuple[float, float, Optional[f
 # --- Fundamentals via FMP ---
 
 def get_fmp_api_key() -> Optional[str]:
-    return st.secrets.get("FMP_API_KEY")
+    """
+    Prefer Streamlit secrets (for Cloud), fall back to environment variable (for local runs).
+    """
+    key = None
+    try:
+        key = st.secrets.get("FMP_API_KEY", None)  # type: ignore[attr-defined]
+    except Exception:
+        key = None
+
+    if not key:
+        key = os.environ.get("FMP_API_KEY")
+
+    return key
 
 
 def fmp_get_json(path: str, params: Optional[dict] = None) -> list:
     key = get_fmp_api_key()
     if not key:
-        raise RuntimeError("FMP_API_KEY environment variable not set.")
+        raise RuntimeError("FMP_API_KEY not set in Streamlit secrets or environment.")
     params = dict(params or {})
     params["apikey"] = key
     url = f"{FMP_BASE_URL}{path}"
@@ -269,7 +295,7 @@ def get_fundamentals(symbol: str, ticker_obj: yf.Ticker, is_fund: bool) -> Funda
         debt_asset_ratio = total_debt / total_assets
 
     fundamentals_ok = True
-    notes = []
+    notes: List[str] = []
 
     if ttm_net_income is None or ttm_net_income <= 0:
         fundamentals_ok = False
@@ -315,9 +341,28 @@ def get_spy_market_regime() -> MarketRegimeResult:
     )
 
 
-# --- Technicals (VALUE rules) ---
+# --- Technicals (VALUE rules, configurable) ---
 
-def get_technical(ticker_obj: yf.Ticker, is_fund: bool) -> TechnicalResult:
+def get_default_strategy() -> StrategyConfig:
+    return StrategyConfig(
+        profile_name="Balanced value (internal default)",
+        stock_rsi_min=25,
+        stock_rsi_max=45,
+        require_stock_below_mid=True,
+        require_stock_above_lower=True,
+        fund_rsi_max=30,
+    )
+
+
+def get_technical(
+    ticker_obj: yf.Ticker,
+    is_fund: bool,
+    strategy: Optional[StrategyConfig] = None,
+) -> TechnicalResult:
+    # Default strategy (Balanced value) if none supplied
+    if strategy is None:
+        strategy = get_default_strategy()
+
     hist = ticker_obj.history(period="1y")
     if hist.empty or "Close" not in hist:
         return TechnicalResult(
@@ -369,23 +414,24 @@ def get_technical(ticker_obj: yf.Ticker, is_fund: bool) -> TechnicalResult:
     bb_mid_20 = float(df["BBM_20"].iloc[-1]) if pd.notna(df["BBM_20"].iloc[-1]) else None
 
     technical_ok = True
-    notes = []
+    notes: List[str] = []
 
     if is_fund:
-        # Funds: classic oversold rule
+        # Funds: oversold rule with configurable max RSI
         if rsi_14 is None:
             technical_ok = False
             notes.append("RSI(14) not available.")
-        elif rsi_14 >= 30:
+        elif rsi_14 >= strategy.fund_rsi_max:
             technical_ok = False
-            notes.append(f"RSI(14) >= 30 ({rsi_14:.2f}).")
+            notes.append(
+                f"RSI(14) >= fund max ({rsi_14:.2f} ≥ {strategy.fund_rsi_max})."
+            )
         else:
-            notes.append(f"RSI(14) < 30 ({rsi_14:.2f}) – passes.")
+            notes.append(
+                f"RSI(14) < fund max ({rsi_14:.2f} < {strategy.fund_rsi_max}) – passes."
+            )
     else:
-        # Stocks: VALUE RULES
-        #  - RSI between 25 and 45 (mildly oversold)
-        #  - Price < mid BB (discounted vs recent mean)
-        #  - Price > lower BB (avoid falling knife)
+        # Stocks: VALUE RULES with configurable RSI range and BB conditions
         if rsi_14 is None:
             technical_ok = False
             notes.append("RSI(14) not available.")
@@ -393,28 +439,42 @@ def get_technical(ticker_obj: yf.Ticker, is_fund: bool) -> TechnicalResult:
             technical_ok = False
             notes.append("Bollinger Bands not available.")
         if technical_ok:
-            rsi_ok = 25 <= rsi_14 <= 45
-            discounted = last_close < bb_mid_20
-            not_crashing = last_close > bb_lower_20
+            rsi_ok = strategy.stock_rsi_min <= rsi_14 <= strategy.stock_rsi_max
+            discounted = (not strategy.require_stock_below_mid) or (last_close < bb_mid_20)
+            not_crashing = (not strategy.require_stock_above_lower) or (last_close > bb_lower_20)
 
             if not rsi_ok:
                 technical_ok = False
-                notes.append(f"RSI(14) not in [25, 45] (value zone): {rsi_14:.2f}.")
-            if not discounted:
-                technical_ok = False
                 notes.append(
-                    f"Price is not below mid Bollinger band (Close {last_close:.2f} ≥ Mid {bb_mid_20:.2f})."
+                    f"RSI(14) not in [{strategy.stock_rsi_min}, {strategy.stock_rsi_max}] "
+                    f"(value zone): {rsi_14:.2f}."
                 )
-            if not not_crashing:
+            if strategy.require_stock_below_mid and not discounted:
                 technical_ok = False
                 notes.append(
-                    f"Price is at/under lower Bollinger band (Close {last_close:.2f} ≤ Lower {bb_lower_20:.2f})."
+                    f"Price is not below mid Bollinger band "
+                    f"(Close {last_close:.2f} ≥ Mid {bb_mid_20:.2f})."
+                )
+            if strategy.require_stock_above_lower and not not_crashing:
+                technical_ok = False
+                notes.append(
+                    f"Price is at/under lower Bollinger band "
+                    f"(Close {last_close:.2f} ≤ Lower {bb_lower_20:.2f})."
                 )
 
             if technical_ok:
-                notes.append(
-                    f"Value conditions met: RSI in [25,45], price between lower ({bb_lower_20:.2f}) and mid ({bb_mid_20:.2f}) bands."
-                )
+                desc_parts = [
+                    f"RSI in [{strategy.stock_rsi_min},{strategy.stock_rsi_max}]",
+                ]
+                if strategy.require_stock_below_mid:
+                    desc_parts.append("price below mid BB (discounted)")
+                else:
+                    desc_parts.append("mid BB discount not required")
+                if strategy.require_stock_above_lower:
+                    desc_parts.append("price above lower BB (not a falling knife)")
+                else:
+                    desc_parts.append("lower BB safety not required")
+                notes.append("Value conditions met: " + "; ".join(desc_parts) + ".")
 
     reason = " ".join(notes) if notes else "Technical rules pass."
     return TechnicalResult(
@@ -430,14 +490,18 @@ def get_technical(ticker_obj: yf.Ticker, is_fund: bool) -> TechnicalResult:
 
 # --- Orchestration ---
 
-def screen_ticker(symbol: str) -> ScreenResult:
+def screen_ticker(
+    symbol: str,
+    precomputed_market: Optional[MarketRegimeResult] = None,
+    strategy: Optional[StrategyConfig] = None,
+) -> ScreenResult:
     symbol = symbol.upper()
     ticker_obj = yf.Ticker(symbol)
     is_fund = detect_is_fund(symbol)
     try:
         fundamentals = get_fundamentals(symbol, ticker_obj, is_fund)
-        market = get_spy_market_regime()
-        technical = get_technical(ticker_obj, is_fund)
+        market = precomputed_market or get_spy_market_regime()
+        technical = get_technical(ticker_obj, is_fund, strategy=strategy)
         return ScreenResult(
             ticker=symbol,
             is_fund=is_fund,
@@ -456,7 +520,7 @@ def screen_ticker(symbol: str) -> ScreenResult:
             source="None",
             reason=f"Error during screening: {e}",
         )
-        dummy_market = MarketRegimeResult(
+        dummy_market = precomputed_market or MarketRegimeResult(
             spy_last_close=float("nan"),
             spy_sma_200=float("nan"),
             spy_trend_ok=False,
@@ -480,13 +544,39 @@ def screen_ticker(symbol: str) -> ScreenResult:
         )
 
 
-def batch_screen_tickers(tickers: List[str]) -> pd.DataFrame:
-    rows = []
-    for sym in tickers:
-        res = screen_ticker(sym)
+def batch_screen_tickers(
+    tickers: List[str],
+    delay_seconds: float = 0.0,
+    strategy: Optional[StrategyConfig] = None,
+) -> pd.DataFrame:
+    rows: List[dict] = []
+
+    # Ensure strategy exists (so we can stamp profile info into CSV)
+    if strategy is None:
+        strategy = get_default_strategy()
+
+    # Compute SPY regime once for the whole batch
+    try:
+        market = get_spy_market_regime()
+    except Exception:
+        market = MarketRegimeResult(
+            spy_last_close=float("nan"),
+            spy_sma_200=float("nan"),
+            spy_trend_ok=False,
+        )
+
+    for i, sym in enumerate(tickers):
+        res = screen_ticker(sym, precomputed_market=market, strategy=strategy)
         rows.append({
             "Symbol": res.ticker,
             "Type": "Fund" if res.is_fund else "Stock",
+            # Profile info "locked in" with each row
+            "Profile": strategy.profile_name,
+            "StockRSIMin": strategy.stock_rsi_min,
+            "StockRSIMax": strategy.stock_rsi_max,
+            "RequireBelowMid": strategy.require_stock_below_mid,
+            "RequireAboveLower": strategy.require_stock_above_lower,
+            "FundRSIMax": strategy.fund_rsi_max,
             "OverallPass": res.passed,
             "Error": res.error,
             "FundamentalsOK": res.fundamentals.fundamentals_ok,
@@ -506,7 +596,160 @@ def batch_screen_tickers(tickers: List[str]) -> pd.DataFrame:
             "TechnicalOK": res.technical.technical_ok,
             "TechNotes": res.technical.reason,
         })
-    return pd.DataFrame(rows)
+
+        if delay_seconds > 0 and i < len(tickers) - 1:
+            time.sleep(delay_seconds)
+
+    df = pd.DataFrame(rows)
+
+    if not df.empty:
+        df.insert(
+            3,
+            "Overall",
+            df["OverallPass"].map(lambda x: "👍 PASS" if x else "👎 NO"),
+        )
+
+    return df
+
+
+# ---------- Strategy builder (UI) ----------
+
+def build_strategy_from_sidebar() -> StrategyConfig:
+    st.subheader("Stock strategy profile")
+
+    mode = st.radio(
+        "Choose a style for stock entries:",
+        [
+            "Balanced value (default)",
+            "Conservative value",
+            "Aggressive bargain",
+            "Custom",
+        ],
+        index=0,
+    )
+
+    if mode == "Balanced value (default)":
+        strategy = StrategyConfig(
+            profile_name="Balanced value (default)",
+            stock_rsi_min=25,
+            stock_rsi_max=45,
+            require_stock_below_mid=True,
+            require_stock_above_lower=True,
+            fund_rsi_max=30,
+        )
+        st.caption(
+            "Balanced value: mildly oversold stocks in healthy trends. "
+            "RSI 25–45, price between lower and mid Bollinger band; funds oversold if RSI < 30."
+        )
+        return strategy
+
+    if mode == "Conservative value":
+        strategy = StrategyConfig(
+            profile_name="Conservative value",
+            stock_rsi_min=35,
+            stock_rsi_max=55,
+            require_stock_below_mid=True,
+            require_stock_above_lower=True,
+            fund_rsi_max=35,
+        )
+        st.caption(
+            "Conservative value: shallower dips in stronger stocks. "
+            "RSI 35–55, still below mid band but not deeply oversold; funds oversold if RSI < 35."
+        )
+        return strategy
+
+    if mode == "Aggressive bargain":
+        strategy = StrategyConfig(
+            profile_name="Aggressive bargain",
+            stock_rsi_min=15,
+            stock_rsi_max=35,
+            require_stock_below_mid=True,
+            require_stock_above_lower=True,
+            fund_rsi_max=30,
+        )
+        st.caption(
+            "Aggressive bargain: deeper value hunting. "
+            "RSI 15–35, close to lower band but still above it to avoid total falling knives; "
+            "funds oversold if RSI < 30."
+        )
+        return strategy
+
+    # Custom mode
+    st.markdown("**Custom stock parameters**")
+
+    stock_rsi_min = st.slider(
+        "Stock RSI min (oversold floor)",
+        min_value=0,
+        max_value=60,
+        value=25,
+        step=1,
+        help="Lower values mean you only buy very oversold stocks.",
+    )
+    stock_rsi_max = st.slider(
+        "Stock RSI max (recovery ceiling)",
+        min_value=10,
+        max_value=80,
+        value=45,
+        step=1,
+        help="Upper bound for how far RSI can recover and still be considered a 'value' entry.",
+    )
+
+    if stock_rsi_max <= stock_rsi_min:
+        st.warning("RSI max should be greater than RSI min; adjust your sliders.")
+
+    require_below_mid = st.checkbox(
+        "Require price below mid Bollinger band (discounted vs recent mean)",
+        value=True,
+    )
+    require_above_lower = st.checkbox(
+        "Require price above lower Bollinger band (avoid falling knife)",
+        value=True,
+    )
+
+    fund_rsi_max = st.slider(
+        "Fund RSI max (oversold threshold)",
+        min_value=10,
+        max_value=50,
+        value=30,
+        step=1,
+        help="Funds with RSI below this value are considered oversold.",
+    )
+
+    st.caption(
+        f"Custom profile: stocks with RSI in [{stock_rsi_min}, {stock_rsi_max}], "
+        f"{'require' if require_below_mid else 'do not require'} price below mid BB, "
+        f"{'require' if require_above_lower else 'do not require'} price above lower BB; "
+        f"funds oversold if RSI < {fund_rsi_max}."
+    )
+
+    return StrategyConfig(
+        profile_name="Custom",
+        stock_rsi_min=float(stock_rsi_min),
+        stock_rsi_max=float(stock_rsi_max),
+        require_stock_below_mid=bool(require_below_mid),
+        require_stock_above_lower=bool(require_above_lower),
+        fund_rsi_max=float(fund_rsi_max),
+    )
+
+
+def render_strategy_legend():
+    """
+    Legend card explaining what each preset means.
+    """
+    st.markdown("### Strategy legend")
+    st.info(
+        "- **Balanced value (default)**  \n"
+        "  • Stocks: RSI 25–45, price between lower and mid Bollinger band (discounted but not crashing).  \n"
+        "  • Funds: RSI < 30.  \n\n"
+        "- **Conservative value**  \n"
+        "  • Stocks: RSI 35–55, still below mid band but only modest dips; avoids deep selloffs.  \n"
+        "  • Funds: RSI < 35.  \n\n"
+        "- **Aggressive bargain**  \n"
+        "  • Stocks: RSI 15–35, closer to the lower band (deeper value); still must hold above lower band.  \n"
+        "  • Funds: RSI < 30.  \n\n"
+        "- **Custom**  \n"
+        "  • You define the RSI window and whether to require mid-band discount and lower-band safety."
+    )
 
 
 # ---------- Streamlit UI ----------
@@ -514,13 +757,34 @@ def batch_screen_tickers(tickers: List[str]) -> pd.DataFrame:
 def main():
     st.title("Value-Focused Stock / Fund Screener")
 
+    # Legend card at top of main area
+    render_strategy_legend()
+
     with st.sidebar:
         st.header("Settings")
         fmp_key = get_fmp_api_key()
         st.markdown(f"**FMP_API_KEY set:** {'✅' if fmp_key else '❌'}")
-        st.write("Rules:")
-        st.write("- **Stocks**: TTM NI>0, Debt/Assets<0.5; RSI(14) ∈ [25,45]; Close between lower & mid BB.")
-        st.write("- **Funds**: RSI(14) < 30.")
+
+        strategy = build_strategy_from_sidebar()
+
+        st.markdown(f"**Active profile:** `{strategy.profile_name}`")
+
+        st.markdown("### Summary of rules")
+        st.write(
+            f"- **Stocks**: TTM NI>0, Debt/Assets<0.5; "
+            f"RSI(14) ∈ [{strategy.stock_rsi_min},{strategy.stock_rsi_max}];"
+        )
+        bb_bits = []
+        if strategy.require_stock_below_mid:
+            bb_bits.append("price below mid BB (discounted)")
+        else:
+            bb_bits.append("mid BB discount not required")
+        if strategy.require_stock_above_lower:
+            bb_bits.append("price above lower BB (not a falling knife)")
+        else:
+            bb_bits.append("lower BB safety not required")
+        st.write(f"  - Stock price conditions: {', '.join(bb_bits)}.")
+        st.write(f"- **Funds**: RSI(14) < {strategy.fund_rsi_max}.")
         st.write("- **Market**: SPY > 200d SMA.")
 
     tab_single, tab_batch = st.tabs(["Single Ticker", "Batch"])
@@ -531,15 +795,16 @@ def main():
             if not ticker.strip():
                 st.warning("Please enter a ticker.")
             else:
-                res = screen_ticker(ticker.strip())
-                st.subheader(f"Result for {res.ticker} ({'Fund' if res.is_fund else 'Stock'})")
+                res = screen_ticker(ticker.strip(), strategy=strategy)
+                st.subheader(
+                    f"Result for {res.ticker} "
+                    f"({'Fund' if res.is_fund else 'Stock'}) — Profile: {strategy.profile_name}"
+                )
                 if res.error:
                     st.error(f"Error: {res.error}")
 
-                # >>> NEW: Big thumbs-up/thumbs-down Overall indicator
                 overall_label = "👍 PASS" if res.passed else "👎 DO NOT BUY"
                 st.subheader(f"Overall: {overall_label}")
-                # <<<
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
@@ -563,7 +828,6 @@ def main():
                         res.fundamentals.reason,
                     ],
                 })
-                fund_ok = "Yes" if res.fundamentals.fundamentals_ok else "No"
                 fund_df["Value"] = fund_df["Value"].astype(str)
                 st.table(fund_df)
 
@@ -576,7 +840,6 @@ def main():
                         res.market.spy_trend_ok,
                     ],
                 })
-                spy_ok = "Yes" if res.market.spy_trend_ok else "No"
                 market_df["Value"] = market_df["Value"].astype(str)
                 st.table(market_df)
 
@@ -592,20 +855,33 @@ def main():
                         res.technical.reason,
                     ],
                 })
-                tech_ok = "Yes" if res.technical.technical_ok else "No"
                 tech_df["Value"] = tech_df["Value"].astype(str)
                 st.table(tech_df)
 
     with tab_batch:
         st.write("Enter one ticker per line.")
-        raw = st.text_area("Tickers", value="LYB\nGLD\nVTI")
+        raw = st.text_area("Tickers", value="AAPL\nMSFT\nQQQ")
+
+        delay_seconds = st.number_input(
+            "Delay between tickers (seconds)",
+            min_value=0.0,
+            max_value=10.0,
+            value=1.0,
+            step=0.5,
+            help="Use a small delay to avoid API rate limits when screening many symbols.",
+        )
+
         if st.button("Run Batch Screen"):
             tickers = [t.strip().upper() for t in raw.splitlines() if t.strip()]
             if not tickers:
                 st.warning("Please enter at least one ticker.")
             else:
-                df = batch_screen_tickers(tickers)
-                st.subheader("Batch Results")
+                df = batch_screen_tickers(
+                    tickers,
+                    delay_seconds=delay_seconds,
+                    strategy=strategy,
+                )
+                st.subheader(f"Batch Results — Profile: {strategy.profile_name}")
                 st.dataframe(df)
                 csv = df.to_csv(index=False).encode("utf-8")
                 st.download_button(
@@ -618,4 +894,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
