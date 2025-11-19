@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-Streamlit UI for a VALUE-FOCUSED stock/fund screener.
-
-Rules:
+Streamlit UI for a VALUE-FOCUSED stock/fund screener with optional MOMENTUM mode.
 
 Fundamentals (stocks only):
     - TTM net income > 0
@@ -12,13 +10,21 @@ Fundamentals (stocks only):
 Market regime:
     - SPY last close > SPY 200-day SMA
 
-Technicals (configurable by strategy profile):
-    - If stock (value style):
+Styles:
+
+1) VALUE:
+    - Stocks:
         * RSI(14) in configurable range (mildly oversold / value zone)
         * Optional: price < 20-day SMA (mid Bollinger band)  [discounted vs recent mean]
         * Optional: price > lower Bollinger band            [not a falling knife]
-    - If fund:
+    - Funds / ETFs / indices / preferreds / bonds:
         * RSI(14) < configurable max (default 30)
+
+2) MOMENTUM (volatility breakout):
+    - Stocks:
+        * Close > upper 20-day Bollinger band (BBU_20) [volatility run breakout]
+    - Funds / ETFs / indices / preferreds / bonds:
+        * RSI(14) < configurable max (same as value-style funds)
 
 Usage:
     python -m streamlit run screener_app.py
@@ -62,7 +68,7 @@ class MarketRegimeResult:
 
 @dataclass
 class TechnicalResult:
-    is_fund: bool
+    is_fund_like: bool  # True for funds/ETFs/indices/prefs/bonds; False for common stock
     last_close: float
     rsi_14: Optional[float]
     bb_lower_20: Optional[float]
@@ -74,7 +80,8 @@ class TechnicalResult:
 @dataclass
 class ScreenResult:
     ticker: str
-    is_fund: bool
+    is_fund_like: bool
+    instrument_type: str  # e.g., "Common stock", "ETF", "Preferred / Bond"
     fundamentals: FundamentalResult
     market: MarketRegimeResult
     technical: TechnicalResult
@@ -84,8 +91,10 @@ class ScreenResult:
     def passed(self) -> bool:
         if self.error is not None:
             return False
-        if self.is_fund:
+        if self.is_fund_like:
+            # For fund-like instruments, we only gate on market + technicals
             return self.market.spy_trend_ok and self.technical.technical_ok
+        # For true stocks, require fundamentals as well
         return (
             self.fundamentals.fundamentals_ok
             and self.market.spy_trend_ok
@@ -96,9 +105,11 @@ class ScreenResult:
 @dataclass
 class StrategyConfig:
     """
-    Configurable technical strategy parameters.
+    Configurable strategy parameters.
+    style: "value" or "momentum"
     """
     profile_name: str
+    style: str  # "value" or "momentum"
     stock_rsi_min: float
     stock_rsi_max: float
     require_stock_below_mid: bool
@@ -108,8 +119,8 @@ class StrategyConfig:
 
 # ---------- Helper functions ----------
 
-def detect_is_fund(symbol: str) -> bool:
-    """Simple heuristic for fund vs stock."""
+def detect_is_fund_symbol_heuristic(symbol: str) -> bool:
+    """Simple heuristic for fund vs stock based on symbol only."""
     s = symbol.upper()
     if s.endswith("X"):
         return True
@@ -118,6 +129,47 @@ def detect_is_fund(symbol: str) -> bool:
         "IWM", "XLK", "XLF", "XLV", "XLE", "XLU",
     }
     return s in etf_like
+
+
+def classify_instrument(ticker_obj: yf.Ticker, symbol: str) -> Tuple[str, bool]:
+    """
+    Classify instrument using yfinance metadata and symbol patterns.
+
+    Returns:
+        (instrument_type_label, is_fund_like)
+
+    - is_fund_like = False → treat as common stock (apply fundamentals)
+    - is_fund_like = True  → treat as fund-like (skip fundamentals; use fund rules)
+    """
+    sym = symbol.upper()
+    info = {}
+    try:
+        info = ticker_obj.info or {}
+    except Exception:
+        info = {}
+
+    quote_type = str(info.get("quoteType") or "").upper()
+    type_disp = str(info.get("typeDisp") or "").upper()
+    category = quote_type or type_disp
+
+    # Preferred / baby bond pattern: e.g., PBIPRB, SEALPRB, XYZ.PR.A, XYZPRC
+    if ("PR" in sym and len(sym) >= 4) or "PREF" in sym:
+        return "Preferred / Bond (symbol pattern)", True
+
+    # Use quoteType when available
+    if category in ("EQUITY", "COMMONSTOCK", "COMMON_STOCK"):
+        return "Common stock", False
+    if category in ("ETF", "MUTUALFUND", "MUTUAL_FUND", "INDEX", "FUND", "CLOSEDENDFUND", "CLOSED_END_FUND"):
+        return "Fund / ETF / Index", True
+    if category in ("PREFERRED_STOCK", "PREFERRED", "PFD", "BOND", "CORPORATE_BOND"):
+        return "Preferred / Bond", True
+
+    # Fallback on symbol-based ETF/fund heuristic
+    if detect_is_fund_symbol_heuristic(sym):
+        return "Fund-like (heuristic)", True
+
+    # Default: assume stock, but flag classification as heuristic
+    return "Stock (heuristic)", False
 
 
 # --- Fundamentals via yfinance ---
@@ -254,16 +306,17 @@ def get_fundamentals_fmp(symbol: str) -> Tuple[float, float, Optional[float], st
 
 # --- Unified fundamentals wrapper ---
 
-def get_fundamentals(symbol: str, ticker_obj: yf.Ticker, is_fund: bool) -> FundamentalResult:
-    if is_fund:
+def get_fundamentals(symbol: str, ticker_obj: yf.Ticker, is_fund_like: bool) -> FundamentalResult:
+    # Skip fundamentals for fund-like instruments (funds/ETFs/indices/prefs/bonds)
+    if is_fund_like:
         return FundamentalResult(
             ttm_net_income=None,
             total_debt=None,
             total_assets=None,
             debt_asset_ratio=None,
             fundamentals_ok=True,
-            source="None (fund: fundamentals skipped).",
-            reason="Fund detected; fundamental rules not applied.",
+            source="None (fund-like: fundamentals skipped).",
+            reason="Fund-like instrument; fundamental rules not applied.",
         )
 
     ttm_net_income = None
@@ -341,11 +394,12 @@ def get_spy_market_regime() -> MarketRegimeResult:
     )
 
 
-# --- Technicals (VALUE rules, configurable) ---
+# --- Technicals (VALUE + MOMENTUM) ---
 
 def get_default_strategy() -> StrategyConfig:
     return StrategyConfig(
         profile_name="Balanced value (internal default)",
+        style="value",
         stock_rsi_min=25,
         stock_rsi_max=45,
         require_stock_below_mid=True,
@@ -356,17 +410,16 @@ def get_default_strategy() -> StrategyConfig:
 
 def get_technical(
     ticker_obj: yf.Ticker,
-    is_fund: bool,
+    is_fund_like: bool,
     strategy: Optional[StrategyConfig] = None,
 ) -> TechnicalResult:
-    # Default strategy (Balanced value) if none supplied
     if strategy is None:
         strategy = get_default_strategy()
 
     hist = ticker_obj.history(period="1y")
     if hist.empty or "Close" not in hist:
         return TechnicalResult(
-            is_fund=is_fund,
+            is_fund_like=is_fund_like,
             last_close=float("nan"),
             rsi_14=None,
             bb_lower_20=None,
@@ -384,7 +437,7 @@ def get_technical(
 
     if bb is None or bb.empty:
         return TechnicalResult(
-            is_fund=is_fund,
+            is_fund_like=is_fund_like,
             last_close=last_close,
             rsi_14=rsi_14,
             bb_lower_20=None,
@@ -395,29 +448,80 @@ def get_technical(
 
     lower_cols = [c for c in bb.columns if c.startswith("BBL_20")]
     mid_cols = [c for c in bb.columns if c.startswith("BBM_20")]
+    upper_cols = [c for c in bb.columns if c.startswith("BBU_20")]
 
-    if not lower_cols or not mid_cols:
+    if not lower_cols or not mid_cols or not upper_cols:
         return TechnicalResult(
-            is_fund=is_fund,
+            is_fund_like=is_fund_like,
             last_close=last_close,
             rsi_14=rsi_14,
             bb_lower_20=None,
             bb_mid_20=None,
             technical_ok=False,
-            reason="Lower or middle Bollinger Band columns not found.",
+            reason="One or more Bollinger Band columns (lower/mid/upper) not found.",
         )
 
     df["BBL_20"] = bb[lower_cols[0]]
     df["BBM_20"] = bb[mid_cols[0]]
+    df["BBU_20"] = bb[upper_cols[0]]
 
     bb_lower_20 = float(df["BBL_20"].iloc[-1]) if pd.notna(df["BBL_20"].iloc[-1]) else None
     bb_mid_20 = float(df["BBM_20"].iloc[-1]) if pd.notna(df["BBM_20"].iloc[-1]) else None
+    bb_upper_20 = float(df["BBU_20"].iloc[-1]) if pd.notna(df["BBU_20"].iloc[-1]) else None
 
     technical_ok = True
     notes: List[str] = []
 
-    if is_fund:
-        # Funds: oversold rule with configurable max RSI
+    # --- MOMENTUM STYLE ---
+    if strategy.style == "momentum":
+        if is_fund_like:
+            # Funds / ETFs / preferreds / bonds: use RSI oversold even in momentum mode
+            if rsi_14 is None:
+                technical_ok = False
+                notes.append("RSI(14) not available.")
+            elif rsi_14 >= strategy.fund_rsi_max:
+                technical_ok = False
+                notes.append(
+                    f"RSI(14) >= fund max ({rsi_14:.2f} ≥ {strategy.fund_rsi_max})."
+                )
+            else:
+                notes.append(
+                    f"RSI(14) < fund max ({rsi_14:.2f} < {strategy.fund_rsi_max}) – passes (fund-style rule)."
+                )
+        else:
+            # Common stocks: pure volatility breakout on upper band
+            if bb_upper_20 is None:
+                technical_ok = False
+                notes.append("Upper Bollinger band not available.")
+            else:
+                if last_close > bb_upper_20:
+                    notes.append(
+                        f"Momentum breakout: Close {last_close:.2f} > Upper BB {bb_upper_20:.2f}."
+                    )
+                else:
+                    technical_ok = False
+                    notes.append(
+                        f"Close {last_close:.2f} is not above Upper BB {bb_upper_20:.2f} "
+                        "(no volatility breakout)."
+                    )
+
+            if rsi_14 is not None:
+                notes.append(f"RSI(14) = {rsi_14:.2f} (informational in momentum mode).")
+
+        reason = " ".join(notes) if notes else "Momentum rules pass."
+        return TechnicalResult(
+            is_fund_like=is_fund_like,
+            last_close=last_close,
+            rsi_14=rsi_14,
+            bb_lower_20=bb_lower_20,
+            bb_mid_20=bb_mid_20,
+            technical_ok=technical_ok,
+            reason=reason,
+        )
+
+    # --- VALUE STYLE ---
+    if is_fund_like:
+        # Funds / ETFs / preferreds / bonds: oversold rule with configurable max RSI
         if rsi_14 is None:
             technical_ok = False
             notes.append("RSI(14) not available.")
@@ -478,7 +582,7 @@ def get_technical(
 
     reason = " ".join(notes) if notes else "Technical rules pass."
     return TechnicalResult(
-        is_fund=is_fund,
+        is_fund_like=is_fund_like,
         last_close=last_close,
         rsi_14=rsi_14,
         bb_lower_20=bb_lower_20,
@@ -497,14 +601,15 @@ def screen_ticker(
 ) -> ScreenResult:
     symbol = symbol.upper()
     ticker_obj = yf.Ticker(symbol)
-    is_fund = detect_is_fund(symbol)
+    instrument_type, is_fund_like = classify_instrument(ticker_obj, symbol)
     try:
-        fundamentals = get_fundamentals(symbol, ticker_obj, is_fund)
+        fundamentals = get_fundamentals(symbol, ticker_obj, is_fund_like)
         market = precomputed_market or get_spy_market_regime()
-        technical = get_technical(ticker_obj, is_fund, strategy=strategy)
+        technical = get_technical(ticker_obj, is_fund_like, strategy=strategy)
         return ScreenResult(
             ticker=symbol,
-            is_fund=is_fund,
+            is_fund_like=is_fund_like,
+            instrument_type=instrument_type,
             fundamentals=fundamentals,
             market=market,
             technical=technical,
@@ -526,7 +631,7 @@ def screen_ticker(
             spy_trend_ok=False,
         )
         dummy_tech = TechnicalResult(
-            is_fund=is_fund,
+            is_fund_like=is_fund_like,
             last_close=float("nan"),
             rsi_14=None,
             bb_lower_20=None,
@@ -536,7 +641,8 @@ def screen_ticker(
         )
         return ScreenResult(
             ticker=symbol,
-            is_fund=is_fund,
+            is_fund_like=is_fund_like,
+            instrument_type=instrument_type,
             fundamentals=dummy_fund,
             market=dummy_market,
             technical=dummy_tech,
@@ -551,11 +657,9 @@ def batch_screen_tickers(
 ) -> pd.DataFrame:
     rows: List[dict] = []
 
-    # Ensure strategy exists (so we can stamp profile info into CSV)
     if strategy is None:
         strategy = get_default_strategy()
 
-    # Compute SPY regime once for the whole batch
     try:
         market = get_spy_market_regime()
     except Exception:
@@ -569,8 +673,9 @@ def batch_screen_tickers(
         res = screen_ticker(sym, precomputed_market=market, strategy=strategy)
         rows.append({
             "Symbol": res.ticker,
-            "Type": "Fund" if res.is_fund else "Stock",
-            # Profile info "locked in" with each row
+            "InstrumentType": res.instrument_type,
+            "StockOrFundLike": "Fund-like" if res.is_fund_like else "Stock",
+            "Style": strategy.style,
             "Profile": strategy.profile_name,
             "StockRSIMin": strategy.stock_rsi_min,
             "StockRSIMax": strategy.stock_rsi_max,
@@ -604,7 +709,7 @@ def batch_screen_tickers(
 
     if not df.empty:
         df.insert(
-            3,
+            5,
             "Overall",
             df["OverallPass"].map(lambda x: "👍 PASS" if x else "👎 NO"),
         )
@@ -615,10 +720,36 @@ def batch_screen_tickers(
 # ---------- Strategy builder (UI) ----------
 
 def build_strategy_from_sidebar() -> StrategyConfig:
-    st.subheader("Stock strategy profile")
+    st.subheader("Strategy")
 
+    style_choice = st.radio(
+        "Trading style",
+        ["Value", "Momentum (volatility breakout for stocks)"],
+        index=0,
+    )
+
+    # MOMENTUM STYLE CONFIG
+    if style_choice.startswith("Momentum"):
+        st.caption(
+            "Momentum breakout for stocks:\n"
+            "- **Stocks**: Close must be above the upper 20-day Bollinger band.\n"
+            "- **Funds / ETFs / preferreds / bonds**: still use RSI oversold (fund-style rule).\n"
+            "- Fundamentals (for stocks) and SPY regime still apply."
+        )
+        return StrategyConfig(
+            profile_name="Momentum breakout (stocks)",
+            style="momentum",
+            stock_rsi_min=0.0,
+            stock_rsi_max=100.0,
+            require_stock_below_mid=False,
+            require_stock_above_lower=False,
+            fund_rsi_max=30.0,  # still oversold threshold for fund-like instruments
+        )
+
+    # VALUE STYLE CONFIG
+    st.subheader("Stock value profile")
     mode = st.radio(
-        "Choose a style for stock entries:",
+        "Choose a value profile:",
         [
             "Balanced value (default)",
             "Conservative value",
@@ -631,6 +762,7 @@ def build_strategy_from_sidebar() -> StrategyConfig:
     if mode == "Balanced value (default)":
         strategy = StrategyConfig(
             profile_name="Balanced value (default)",
+            style="value",
             stock_rsi_min=25,
             stock_rsi_max=45,
             require_stock_below_mid=True,
@@ -638,14 +770,16 @@ def build_strategy_from_sidebar() -> StrategyConfig:
             fund_rsi_max=30,
         )
         st.caption(
-            "Balanced value: mildly oversold stocks in healthy trends. "
-            "RSI 25–45, price between lower and mid Bollinger band; funds oversold if RSI < 30."
+            "Balanced value: mildly oversold stocks in healthy trends.\n"
+            "- Stocks: RSI 25–45, price between lower and mid Bollinger band.\n"
+            "- Fund-like instruments: RSI < 30."
         )
         return strategy
 
     if mode == "Conservative value":
         strategy = StrategyConfig(
             profile_name="Conservative value",
+            style="value",
             stock_rsi_min=35,
             stock_rsi_max=55,
             require_stock_below_mid=True,
@@ -653,14 +787,16 @@ def build_strategy_from_sidebar() -> StrategyConfig:
             fund_rsi_max=35,
         )
         st.caption(
-            "Conservative value: shallower dips in stronger stocks. "
-            "RSI 35–55, still below mid band but not deeply oversold; funds oversold if RSI < 35."
+            "Conservative value: shallower dips in stronger stocks.\n"
+            "- Stocks: RSI 35–55, still below mid band but not deeply oversold.\n"
+            "- Fund-like instruments: RSI < 35."
         )
         return strategy
 
     if mode == "Aggressive bargain":
         strategy = StrategyConfig(
             profile_name="Aggressive bargain",
+            style="value",
             stock_rsi_min=15,
             stock_rsi_max=35,
             require_stock_below_mid=True,
@@ -668,13 +804,13 @@ def build_strategy_from_sidebar() -> StrategyConfig:
             fund_rsi_max=30,
         )
         st.caption(
-            "Aggressive bargain: deeper value hunting. "
-            "RSI 15–35, close to lower band but still above it to avoid total falling knives; "
-            "funds oversold if RSI < 30."
+            "Aggressive bargain: deeper value hunting.\n"
+            "- Stocks: RSI 15–35, close to lower band but must remain above it.\n"
+            "- Fund-like instruments: RSI < 30."
         )
         return strategy
 
-    # Custom mode
+    # Custom value profile
     st.markdown("**Custom stock parameters**")
 
     stock_rsi_min = st.slider(
@@ -707,23 +843,24 @@ def build_strategy_from_sidebar() -> StrategyConfig:
     )
 
     fund_rsi_max = st.slider(
-        "Fund RSI max (oversold threshold)",
+        "Fund-like RSI max (oversold threshold)",
         min_value=10,
         max_value=50,
         value=30,
         step=1,
-        help="Funds with RSI below this value are considered oversold.",
+        help="Fund-like instruments with RSI below this value are considered oversold.",
     )
 
     st.caption(
-        f"Custom profile: stocks with RSI in [{stock_rsi_min}, {stock_rsi_max}], "
+        f"Custom value profile: stocks with RSI in [{stock_rsi_min}, {stock_rsi_max}], "
         f"{'require' if require_below_mid else 'do not require'} price below mid BB, "
         f"{'require' if require_above_lower else 'do not require'} price above lower BB; "
-        f"funds oversold if RSI < {fund_rsi_max}."
+        f"fund-like instruments oversold if RSI < {fund_rsi_max}."
     )
 
     return StrategyConfig(
-        profile_name="Custom",
+        profile_name="Custom value",
+        style="value",
         stock_rsi_min=float(stock_rsi_min),
         stock_rsi_max=float(stock_rsi_max),
         require_stock_below_mid=bool(require_below_mid),
@@ -734,30 +871,31 @@ def build_strategy_from_sidebar() -> StrategyConfig:
 
 def render_strategy_legend():
     """
-    Legend card explaining what each preset means.
+    Legend card explaining value vs momentum presets and instrument classification.
     """
-    st.markdown("### Strategy legend")
+    st.markdown("### Strategy & instrument legend")
     st.info(
-        "- **Balanced value (default)**  \n"
-        "  • Stocks: RSI 25–45, price between lower and mid Bollinger band (discounted but not crashing).  \n"
-        "  • Funds: RSI < 30.  \n\n"
-        "- **Conservative value**  \n"
-        "  • Stocks: RSI 35–55, still below mid band but only modest dips; avoids deep selloffs.  \n"
-        "  • Funds: RSI < 35.  \n\n"
-        "- **Aggressive bargain**  \n"
-        "  • Stocks: RSI 15–35, closer to the lower band (deeper value); still must hold above lower band.  \n"
-        "  • Funds: RSI < 30.  \n\n"
-        "- **Custom**  \n"
-        "  • You define the RSI window and whether to require mid-band discount and lower-band safety."
+        "- **Instrument types**  \n"
+        "  • *Common stock*: fundamentals + technicals + market regime.  \n"
+        "  • *Fund / ETF / Index*: treated as fund-like (technicals only).  \n"
+        "  • *Preferred / Bond*: treated as fund-like (technicals only).  \n"
+        "  • *Heuristic* labels use symbol patterns or fallback rules when Yahoo metadata is missing.\n\n"
+        "- **Value style**  \n"
+        "  • Stocks: RSI window + band placement (discounted but not a falling knife).  \n"
+        "  • Fund-like: RSI below a configurable oversold threshold (mean reversion).  \n\n"
+        "- **Momentum style (stocks)**  \n"
+        "  • Stocks: Close above the upper 20-day Bollinger band (volatility breakout).  \n"
+        "  • Fund-like: still use RSI oversold (fund-style rule) – no upper-band requirement.  \n"
+        "  • Fundamentals (for stocks) and SPY > 200d SMA still enforced."
     )
 
 
 # ---------- Streamlit UI ----------
 
 def main():
-    st.title("Value-Focused Stock / Fund Screener")
+    st.title("Stock / Fund Screener — Value & Momentum")
 
-    # Legend card at top of main area
+    # Legend card
     render_strategy_legend()
 
     with st.sidebar:
@@ -767,25 +905,37 @@ def main():
 
         strategy = build_strategy_from_sidebar()
 
-        st.markdown(f"**Active profile:** `{strategy.profile_name}`")
+        st.markdown(f"**Active style:** `{strategy.style}`")
+        st.markdown(f"**Profile:** `{strategy.profile_name}`")
 
         st.markdown("### Summary of rules")
-        st.write(
-            f"- **Stocks**: TTM NI>0, Debt/Assets<0.5; "
-            f"RSI(14) ∈ [{strategy.stock_rsi_min},{strategy.stock_rsi_max}];"
-        )
-        bb_bits = []
-        if strategy.require_stock_below_mid:
-            bb_bits.append("price below mid BB (discounted)")
+        if strategy.style == "momentum":
+            st.write(
+                "- **Style**: Momentum (volatility breakout for stocks).  \n"
+                "- **Stocks**: Close > Upper Bollinger Band (20d).  \n"
+                "- **Fund-like instruments**: RSI(14) < "
+                f"{strategy.fund_rsi_max} (fund-style oversold rule).  \n"
+                "- **Stocks** still require TTM NI>0 and Debt/Assets<0.5.  \n"
+                "- **Market**: SPY > 200d SMA."
+            )
         else:
-            bb_bits.append("mid BB discount not required")
-        if strategy.require_stock_above_lower:
-            bb_bits.append("price above lower BB (not a falling knife)")
-        else:
-            bb_bits.append("lower BB safety not required")
-        st.write(f"  - Stock price conditions: {', '.join(bb_bits)}.")
-        st.write(f"- **Funds**: RSI(14) < {strategy.fund_rsi_max}.")
-        st.write("- **Market**: SPY > 200d SMA.")
+            st.write(
+                f"- **Style**: Value.  \n"
+                f"- **Stocks**: TTM NI>0, Debt/Assets<0.5; "
+                f"RSI(14) ∈ [{strategy.stock_rsi_min},{strategy.stock_rsi_max}]."
+            )
+            bb_bits = []
+            if strategy.require_stock_below_mid:
+                bb_bits.append("price below mid BB (discounted)")
+            else:
+                bb_bits.append("mid BB discount not required")
+            if strategy.require_stock_above_lower:
+                bb_bits.append("price above lower BB (not a falling knife)")
+            else:
+                bb_bits.append("lower BB safety not required")
+            st.write(f"  - Stock price conditions: {', '.join(bb_bits)}.")
+            st.write(f"- **Fund-like**: RSI(14) < {strategy.fund_rsi_max}.")
+            st.write("- **Market**: SPY > 200d SMA.")
 
     tab_single, tab_batch = st.tabs(["Single Ticker", "Batch"])
 
@@ -798,7 +948,8 @@ def main():
                 res = screen_ticker(ticker.strip(), strategy=strategy)
                 st.subheader(
                     f"Result for {res.ticker} "
-                    f"({'Fund' if res.is_fund else 'Stock'}) — Profile: {strategy.profile_name}"
+                    f"({res.instrument_type}) — "
+                    f"{strategy.style.capitalize()} / {strategy.profile_name}"
                 )
                 if res.error:
                     st.error(f"Error: {res.error}")
@@ -808,13 +959,13 @@ def main():
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("Type", "Fund" if res.is_fund else "Stock")
+                    st.metric("Instrument type", res.instrument_type)
                 with col2:
-                    st.metric("SPY > 200d SMA?", "Yes" if res.market.spy_trend_ok else "No")
+                    st.metric("Fund-like?", "Yes" if res.is_fund_like else "No")
                 with col3:
-                    st.metric("Technical OK?", "Yes" if res.technical.technical_ok else "No")
+                    st.metric("SPY > 200d SMA?", "Yes" if res.market.spy_trend_ok else "No")
 
-                st.markdown("### Fundamentals")
+                st.markdown("### Fundamentals (stocks only)")
                 fund_df = pd.DataFrame({
                     "Metric": ["Source", "TTM Net Income", "Total Debt", "Total Assets",
                                "Debt/Assets", "Fundamentals OK", "Notes"],
@@ -843,7 +994,7 @@ def main():
                 market_df["Value"] = market_df["Value"].astype(str)
                 st.table(market_df)
 
-                st.markdown("### Technicals (Value Rules)")
+                st.markdown("### Technicals")
                 tech_df = pd.DataFrame({
                     "Metric": ["Last Close", "RSI(14)", "BB Lower 20", "BB Mid 20", "Technical OK", "Notes"],
                     "Value": [
@@ -881,7 +1032,9 @@ def main():
                     delay_seconds=delay_seconds,
                     strategy=strategy,
                 )
-                st.subheader(f"Batch Results — Profile: {strategy.profile_name}")
+                st.subheader(
+                    f"Batch Results — Style: {strategy.style}, Profile: {strategy.profile_name}"
+                )
                 st.dataframe(df)
                 csv = df.to_csv(index=False).encode("utf-8")
                 st.download_button(
